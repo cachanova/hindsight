@@ -1595,6 +1595,7 @@ class LLMProvider:
         bank_id: str | None = None,
         operation: str | None = None,
         metadata: dict[str, Any] | None = None,
+        routing_metadata: dict[str, Any] | None = None,
     ) -> "ConfiguredLLMProvider":
         """
         Return a configured wrapper for a specific bank operation.
@@ -1609,6 +1610,8 @@ class LLMProvider:
             operation: Logical operation label ("retain", "reflect", ...) for
                 LLM trace rows.
             metadata: Optional extra caller metadata stored on trace rows.
+            routing_metadata: Optional ephemeral values used by a multi-LLM
+                router. Ignored by a single provider and never persisted.
 
         Returns:
             A ``ConfiguredLLMProvider`` that delegates to this provider with

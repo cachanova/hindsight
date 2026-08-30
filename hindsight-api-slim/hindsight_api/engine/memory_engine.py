@@ -47,6 +47,7 @@ from ..config import (
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
+    LLM_STRATEGY_METADATA,
     HindsightConfig,
     LLMMemberConfig,
     LLMStrategyConfig,
@@ -683,6 +684,44 @@ def _build_llm(
     return MultiLLMProvider([base, *extra], strategy)
 
 
+@dataclass(frozen=True)
+class _AppendRoutingState:
+    """Stored classification that an append must route and optionally inherit."""
+
+    tags: list[str]
+    metadata: dict[str, Any]
+
+
+def _retain_llm_routing_metadata(
+    contents: list[RetainContentDict],
+    document_tags: list[str] | None,
+    append_states: list[_AppendRoutingState] | None = None,
+) -> dict[str, list[str]]:
+    """Build ephemeral metadata used to select a retain LLM member.
+
+    A retain LLM prompt may combine several items, so each key carries the
+    union of values present in the batch. Matching any sensitive item therefore
+    routes the whole prompt to the sensitive lane instead of exposing its peers
+    to the primary. User metadata is namespaced to keep the reserved ``tags``
+    route key unambiguous.
+    """
+    values: dict[str, set[str]] = {}
+    tags = set(document_tags or [])
+    for state in append_states or []:
+        tags.update(state.tags)
+        for key, value in state.metadata.items():
+            if value is not None:
+                values.setdefault(f"metadata.{key}", set()).add(str(value))
+    for item in contents:
+        tags.update(item.get("tags", []) or [])
+        for key, value in (item.get("metadata") or {}).items():
+            if value is not None:
+                values.setdefault(f"metadata.{key}", set()).add(str(value))
+    if tags:
+        values["tags"] = tags
+    return {key: sorted(route_values) for key, route_values in values.items()}
+
+
 async def validate_retain_batch_support(
     retain_llm_config: "LLMConfig | MultiLLMProvider", config: HindsightConfig
 ) -> None:
@@ -690,9 +729,9 @@ async def validate_retain_batch_support(
 
     Otherwise the server would silently fall back to sync mode on every retain,
     which is confusing and wastes a config knob. For a multi-LLM chain the
-    capability is evaluated across ALL members, not just the primary: batch
-    capacity may live on a secondary (issue #3645), and gating on the primary
-    alone rejected configurations that would in fact have worked.
+    failover/round-robin capacity is evaluated across all members because it may
+    live on a secondary (issue #3645). Metadata mode instead requires every
+    route-selectable member because each request is pinned before submission.
     """
     if not config.retain_batch_enabled:
         return
@@ -700,8 +739,15 @@ async def validate_retain_batch_support(
         return
 
     if isinstance(retain_llm_config, MultiLLMProvider):
-        members = ", ".join(f"'{member.provider}'" for member in retain_llm_config.members)
-        cause = f"no member of the retain LLM chain ({members}) supports the batch API"
+        if retain_llm_config.strategy.mode == LLM_STRATEGY_METADATA:
+            selectable_indices = {0, *(route.member for route in retain_llm_config.strategy.routes or [])}
+            members = ", ".join(
+                f"'{retain_llm_config.members[index].provider}'" for index in sorted(selectable_indices)
+            )
+            cause = f"metadata routing requires every selectable retain LLM member ({members}) to support the batch API"
+        else:
+            members = ", ".join(f"'{member.provider}'" for member in retain_llm_config.members)
+            cause = f"no member of the retain LLM chain ({members}) supports the batch API"
     else:
         cause = f"the retain LLM provider '{retain_llm_config.provider}' does not support the batch API"
     raise RuntimeError(
@@ -5146,6 +5192,45 @@ class MemoryEngine(MemoryEngineInterface):
                     "document text is not stored and cannot be appended to. Use update_mode='replace' instead."
                 )
 
+        # Append re-extracts the stored document body along with the new text.
+        # Capture its classification once, before the first sub-batch can
+        # overwrite the document record, so every slice stays on the same
+        # metadata-routed LLM lane even when the append omits those fields.
+        stored_append_states = await self._stored_append_routing_states(bank_id, contents)
+
+        # Append updates inherit stored classification keys so adding unrelated
+        # tags/metadata cannot silently erase the routing policy for the next
+        # append. An explicitly supplied empty collection remains an intentional
+        # declassification; the current append still routes with the old state
+        # because its prompt reprocesses the old body, while later appends see
+        # the cleared state.
+        for item in contents:
+            if item.get("update_mode") != "append" or not item.get("document_id"):
+                continue
+            stored_state = stored_append_states.get(item["document_id"])
+            if stored_state is None:
+                continue
+            item_tags = item.get("tags")
+            tags_explicitly_cleared = item_tags == [] or document_tags == []
+            if stored_state.tags and not tags_explicitly_cleared:
+                item["tags"] = list(dict.fromkeys([*stored_state.tags, *(item_tags or [])]))
+
+            item_metadata = item.get("metadata")
+            if stored_state.metadata and item_metadata != {}:
+                item["metadata"] = {**stored_state.metadata, **(item_metadata or {})}
+
+        # Validate the complete submission before token splitting or per-document
+        # grouping can hide a cross-member classification conflict. No LLM call
+        # may start when one logical retain operation belongs to multiple lanes.
+        if isinstance(self._retain_llm_config, MultiLLMProvider):
+            self._retain_llm_config.validate_routing_metadata(
+                _retain_llm_routing_metadata(
+                    contents,
+                    document_tags,
+                    list(stored_append_states.values()),
+                )
+            )
+
         # Fold items that share an explicit document_id into one document. On the
         # synchronous in-process path this is safe — sub-batches run sequentially,
         # so same-document items cannot race (unlike the queued path, which still
@@ -5171,6 +5256,7 @@ class MemoryEngine(MemoryEngineInterface):
                 document_id=document_id,
                 fact_type_override=fact_type_override,
                 document_tags=document_tags,
+                routing_append_states=list(stored_append_states.values()),
                 operation_id=operation_id,
                 strategy=strategy,
                 outbox_callback=outbox_callback,
@@ -5233,6 +5319,11 @@ class MemoryEngine(MemoryEngineInterface):
                     is_first_batch=True,
                     fact_type_override=fact_type_override,
                     document_tags=document_tags,
+                    routing_append_states=(
+                        [stored_append_states[group.document_id]]
+                        if group.document_id is not None and group.document_id in stored_append_states
+                        else []
+                    ),
                     operation_id=operation_id,
                     strategy=strategy,
                     outbox_callback=group_outbox_callback,
@@ -5460,6 +5551,104 @@ class MemoryEngine(MemoryEngineInterface):
             structured_chunk_size=config.retain_structured_chunk_size,
         )
 
+    async def _stored_append_routing_states(
+        self,
+        bank_id: str,
+        contents: list[RetainContentDict],
+    ) -> dict[str, _AppendRoutingState]:
+        """Read existing append classification before retain can replace it.
+
+        This is only needed for metadata-routed retain chains. Other strategies
+        keep their existing append path and do not pay for an extra database read.
+        """
+        if not (
+            isinstance(self._retain_llm_config, MultiLLMProvider)
+            and self._retain_llm_config.strategy.mode == LLM_STRATEGY_METADATA
+        ):
+            return {}
+
+        append_document_ids = {
+            item["document_id"] for item in contents if item.get("update_mode") == "append" and item.get("document_id")
+        }
+        if not append_document_ids:
+            return {}
+
+        stored_states: dict[str, _AppendRoutingState] = {}
+        backend = await self._get_backend()
+        from .memories import get_memories
+
+        store = get_memories()
+        async with acquire_with_retry(backend) as conn:
+            for append_document_id in append_document_ids:
+                row = await conn.fetchrow(
+                    f"SELECT tags, retain_params FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+                    append_document_id,
+                    bank_id,
+                )
+                tags = row["tags"] if row else None
+                retain_params = row["retain_params"] if row else None
+
+                # A store-owned document may have no SQL row at all. Even when a
+                # metadata row exists, the store record is authoritative and is
+                # the same record the append body path reads before prepending.
+                if store.owns_document_store_for(bank_id):
+                    record = await store.get_document_record(
+                        bank_id=bank_id,
+                        document_id=append_document_id,
+                    )
+                    if record is not None:
+                        if record.get("tags") is not None:
+                            tags = record["tags"]
+                        record_metadata = record.get("metadata") or {}
+                        if record_metadata.get("retain_params") is not None:
+                            retain_params = record_metadata["retain_params"]
+
+                if tags is None and retain_params is None:
+                    continue
+                tags = conn.parse_json(tags)
+                retain_params = conn.parse_json(retain_params)
+                metadata = retain_params.get("metadata", {}) if isinstance(retain_params, dict) else {}
+                stored_states[append_document_id] = _AppendRoutingState(
+                    tags=list(tags or []),
+                    metadata=dict(metadata) if isinstance(metadata, dict) else {},
+                )
+        return stored_states
+
+    def _reflect_llm_routing_metadata(
+        self,
+        llm_config: "LLMConfig | MultiLLMProvider",
+    ) -> dict[str, list[str]]:
+        """Bind reflect to the first configured tag route.
+
+        Reflect selects its LLM before the agent runs retrieval tools. Even an
+        exact tag scope can expand an allowed fact to its full document, whose
+        other facts may carry a protected tag. A preflight existence query would
+        also race with concurrent retain. Include every configured tag route so
+        the whole agent loop and mental-model delta calls stay fail-closed.
+
+        Non-metadata strategies return without additional work.
+        """
+        if not (isinstance(llm_config, MultiLLMProvider) and llm_config.strategy.mode == LLM_STRATEGY_METADATA):
+            return {}
+
+        route_tags = {route.value for route in llm_config.strategy.routes or [] if route.key == "tags"}
+        return {"tags": sorted(route_tags)} if route_tags else {}
+
+    def _pending_consolidation_llm_routing_metadata(self) -> dict[str, list[str]]:
+        """Bind consolidation fail-closed against facts retained mid-run.
+
+        A consolidation job repeatedly fetches pending batches. A sensitive fact
+        may arrive after startup, so a point-in-time existence check cannot safely
+        select the primary for the whole job. Including every configured tag route
+        keeps all batches on the first matching protected lane.
+        """
+        llm_config = self._consolidation_llm_config
+        if not (isinstance(llm_config, MultiLLMProvider) and llm_config.strategy.mode == LLM_STRATEGY_METADATA):
+            return {}
+
+        route_tags = {route.value for route in llm_config.strategy.routes or [] if route.key == "tags"}
+        return {"tags": sorted(route_tags)} if route_tags else {}
+
     async def _run_retain_execution(
         self,
         *,
@@ -5469,6 +5658,7 @@ class MemoryEngine(MemoryEngineInterface):
         document_id: str | None,
         fact_type_override: str | None,
         document_tags: list[str] | None,
+        routing_append_states: list[_AppendRoutingState],
         operation_id: str | None,
         strategy: str | None,
         outbox_callback: RetainOutboxCallback | None,
@@ -5654,6 +5844,7 @@ class MemoryEngine(MemoryEngineInterface):
                     is_first_batch=idx == 1,  # Only upsert on first batch
                     fact_type_override=fact_type_override,
                     document_tags=document_tags,
+                    routing_append_states=routing_append_states,
                     operation_id=operation_id,
                     strategy=strategy,
                     # Outbox callback runs inside the last sub-batch's transaction so the
@@ -5828,6 +6019,7 @@ class MemoryEngine(MemoryEngineInterface):
                     is_first_batch=True,
                     fact_type_override=fact_type_override,
                     document_tags=document_tags,
+                    routing_append_states=routing_append_states,
                     operation_id=operation_id,
                     strategy=strategy,
                     outbox_callback=outbox_callback,
@@ -5877,6 +6069,7 @@ class MemoryEngine(MemoryEngineInterface):
         is_first_batch: bool = True,
         fact_type_override: str | None = None,
         document_tags: list[str] | None = None,
+        routing_append_states: list[_AppendRoutingState] | None = None,
         operation_id: str | None = None,
         outbox_callback: RetainOutboxCallback | None = None,
         outbox_callback_factory: RetainOutboxCallbackFactory | None = None,
@@ -5903,6 +6096,8 @@ class MemoryEngine(MemoryEngineInterface):
             is_first_batch: Whether this is the first batch (for chunked operations, only delete on first batch)
             fact_type_override: Override fact type for all facts
             document_tags: Tags applied to all items in this batch
+            routing_append_states: Existing append-document classification used
+                for LLM selection; omitted fields also inherit it before this call
 
         Returns:
             Tuple of (unit ID lists, LLM token usage, processed_content_tokens).
@@ -5928,7 +6123,16 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Create parent span for retain operation
         with create_operation_span("retain", bank_id):
-            retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
+            retain_llm = self._retain_llm_config.with_config(
+                resolved_config,
+                bank_id=bank_id,
+                operation="retain",
+                routing_metadata=_retain_llm_routing_metadata(
+                    contents,
+                    document_tags,
+                    routing_append_states,
+                ),
+            )
             result = await self._retain_batch_with_append_retry(
                 pool=self._backend,
                 embeddings_model=self.embeddings,
@@ -13023,6 +13227,7 @@ class MemoryEngine(MemoryEngineInterface):
         # This is critical for banks with many mental models to avoid huge prompts.
 
         resolved_reflect_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        reflect_routing_metadata = self._reflect_llm_routing_metadata(self._reflect_llm_config)
 
         # Compute max iterations based on budget
         config = get_config()
@@ -13207,7 +13412,10 @@ class MemoryEngine(MemoryEngineInterface):
                 agent_result = await asyncio.wait_for(
                     run_reflect_agent(
                         llm_config=self._reflect_llm_config.with_config(
-                            resolved_reflect_config, bank_id=bank_id, operation=_operation_label
+                            resolved_reflect_config,
+                            bank_id=bank_id,
+                            operation=_operation_label,
+                            routing_metadata=reflect_routing_metadata,
                         ),
                         bank_id=bank_id,
                         query=query,
@@ -15344,11 +15552,13 @@ class MemoryEngine(MemoryEngineInterface):
             nonlocal _op_llm_config
             if _op_llm_config is None:
                 resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+                routing_metadata = self._reflect_llm_routing_metadata(self._reflect_llm_config)
                 _op_llm_config = self._reflect_llm_config.with_config(
                     resolved_config,
                     bank_id=bank_id,
                     operation="mental_model_delta_ops",
                     metadata={"mental_model_id": str(mental_model_id)},
+                    routing_metadata=routing_metadata,
                 )
             return _op_llm_config
 
@@ -19504,6 +19714,23 @@ class MemoryEngine(MemoryEngineInterface):
                 f"batch synchronously (async=false), which processes them sequentially."
             )
 
+        # Validate the parent payload before child packing, database inserts, or
+        # task dispatch. Otherwise classifications routed to different members
+        # can land in separate workers and each appear unambiguous in isolation.
+        routing_contents = cast(list[RetainContentDict], contents)
+        if (
+            isinstance(self._retain_llm_config, MultiLLMProvider)
+            and self._retain_llm_config.strategy.mode == LLM_STRATEGY_METADATA
+        ):
+            stored_append_states = await self._stored_append_routing_states(bank_id, routing_contents)
+            self._retain_llm_config.validate_routing_metadata(
+                _retain_llm_routing_metadata(
+                    routing_contents,
+                    document_tags,
+                    list(stored_append_states.values()),
+                )
+            )
+
         # Calculate total token count and determine if we need to split
         total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)
         config = get_config()
@@ -19516,7 +19743,7 @@ class MemoryEngine(MemoryEngineInterface):
         # on the same document_id and trigger FK violations in the final
         # ANN pass (issue #1795). The worker's in-process splitter
         # handles intra-document chunking sequentially.
-        sub_batches = _split_contents_into_async_children(cast(list[RetainContentDict], contents), tokens_per_batch)
+        sub_batches = _split_contents_into_async_children(routing_contents, tokens_per_batch)
 
         # Log splitting info if we actually split
         if len(sub_batches) > 1:
@@ -19606,7 +19833,7 @@ class MemoryEngine(MemoryEngineInterface):
                             )
 
                         task_payload: dict[str, Any] = {"contents": sub_batch}
-                        if document_tags:
+                        if document_tags is not None:
                             task_payload["document_tags"] = document_tags
                         if strategy:
                             task_payload["strategy"] = strategy
