@@ -1,16 +1,17 @@
 """End-to-end retain coverage for metadata-based LLM routing."""
 
+import copy
 import dataclasses
 import uuid
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
 from hindsight_api.config import LLMMetadataRoute, LLMStrategyConfig, _get_raw_config
 from hindsight_api.engine import memory_engine as engine_module
-from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.llm_wrapper import LLMProvider
 from hindsight_api.engine.multi_llm import MultiLLMProvider
-from hindsight_api.engine.schema import fq_table
 
 
 @dataclasses.dataclass
@@ -92,8 +93,8 @@ def _install_ambiguous_metadata_router(memory, monkeypatch) -> None:
         LLMStrategyConfig(
             mode="metadata",
             routes=[
-                LLMMetadataRoute(key="tags", value="internal", member=1),
-                LLMMetadataRoute(key="tags", value="sensitive", member=2),
+                LLMMetadataRoute(key="metadata.classification", value="internal", member=1),
+                LLMMetadataRoute(key="metadata.clearance", value="restricted", member=2),
             ],
         ),
     )
@@ -135,8 +136,8 @@ async def test_split_sync_retain_rejects_cross_member_classification_before_llm(
     monkeypatch.setattr(engine_module, "get_config", lambda: narrowed)
     bank_id = f"metadata-routing-mixed-sync-{uuid.uuid4().hex[:8]}"
     contents = [
-        {"content": " ".join(["internal"] * 80), "tags": ["internal"]},
-        {"content": " ".join(["sensitive"] * 80), "tags": ["sensitive"]},
+        {"content": " ".join(["internal"] * 80), "metadata": {"classification": "internal"}},
+        {"content": " ".join(["sensitive"] * 80), "metadata": {"clearance": "restricted"}},
     ]
 
     with pytest.raises(ValueError, match="select multiple members"):
@@ -155,8 +156,8 @@ async def test_queued_retain_rejects_cross_member_classification_before_children
     monkeypatch.setattr(engine_module, "get_config", lambda: narrowed)
     bank_id = f"metadata-routing-mixed-queued-{uuid.uuid4().hex[:8]}"
     contents = [
-        {"content": " ".join(["internal"] * 80), "tags": ["internal"]},
-        {"content": " ".join(["sensitive"] * 80), "tags": ["sensitive"]},
+        {"content": " ".join(["internal"] * 80), "metadata": {"classification": "internal"}},
+        {"content": " ".join(["sensitive"] * 80), "metadata": {"clearance": "restricted"}},
     ]
 
     with pytest.raises(ValueError, match="select multiple members"):
@@ -434,6 +435,114 @@ async def test_custom_metadata_is_inherited_for_append_routing(
     assert calls.secondary == 0
 
 
+async def test_shared_document_persists_non_first_item_metadata_for_append_routing(
+    memory_no_llm_verify, request_context, monkeypatch
+) -> None:
+    calls = _install_metadata_router(
+        memory_no_llm_verify,
+        monkeypatch,
+        key="metadata.classification",
+        value="restricted",
+    )
+    bank_id = f"metadata-routing-shared-{uuid.uuid4().hex[:8]}"
+    document_id = "shared-restricted-document"
+    contents = [
+        {"content": "Public preface.", "document_id": document_id},
+        {
+            "content": "Restricted details.",
+            "document_id": document_id,
+            "metadata": {"classification": "restricted"},
+        },
+    ]
+    original_contents = copy.deepcopy(contents)
+
+    await memory_no_llm_verify.retain_batch_async(
+        bank_id,
+        contents,
+        request_context=request_context,
+    )
+    assert calls.secondary > 0
+    assert calls.primary == 0
+    assert contents == original_contents
+
+    document = await memory_no_llm_verify.get_document(document_id, bank_id, request_context=request_context)
+    assert document is not None
+    assert document["document_metadata"] == {"classification": "restricted"}
+
+    calls.reset()
+    await memory_no_llm_verify.retain_batch_async(
+        bank_id,
+        [{"content": "Append without metadata.", "document_id": document_id, "update_mode": "append"}],
+        request_context=request_context,
+    )
+    assert calls.secondary > 0
+    assert calls.primary == 0
+
+
+async def test_append_routing_bulk_reads_store_after_releasing_sql_connection(
+    memory_no_llm_verify, monkeypatch
+) -> None:
+    from hindsight_api.engine.memories import set_memories
+    from tests.test_memories_extension import InMemoryMemories
+
+    connection_held = False
+    sql_calls: list[tuple[str, list[str], str]] = []
+
+    class FakeConnection:
+        async def fetch(self, query, document_ids, bank_id):
+            assert connection_held
+            sql_calls.append((query, document_ids, bank_id))
+            return []
+
+    @asynccontextmanager
+    async def fake_acquire(_backend):
+        nonlocal connection_held
+        connection_held = True
+        try:
+            yield FakeConnection()
+        finally:
+            connection_held = False
+
+    class BulkDocumentStore(InMemoryMemories):
+        def __init__(self):
+            super().__init__({})
+            self.bulk_calls = 0
+
+        async def get_document_records(self, *, bank_id, document_ids):
+            assert not connection_held
+            self.bulk_calls += 1
+            return {
+                "doc-a": {"tags": ["sensitive"], "metadata": {}},
+                "doc-b": {
+                    "tags": [],
+                    "metadata": {"retain_params": {"metadata": {"classification": "restricted"}}},
+                },
+            }
+
+    _install_metadata_router(memory_no_llm_verify, monkeypatch)
+    monkeypatch.setattr(engine_module, "acquire_with_retry", fake_acquire)
+    monkeypatch.setattr(memory_no_llm_verify, "_get_backend", AsyncMock(return_value=object()))
+    store = BulkDocumentStore()
+    set_memories(store)
+    try:
+        states = await memory_no_llm_verify._stored_append_routing_states(
+            "bank",
+            [
+                {"content": "a", "document_id": "doc-a", "update_mode": "append"},
+                {"content": "b", "document_id": "doc-b", "update_mode": "append"},
+            ],
+        )
+    finally:
+        set_memories(None)
+
+    assert len(sql_calls) == 1
+    assert "id = ANY($1::text[])" in sql_calls[0][0]
+    assert sql_calls[0][1:] == (["doc-a", "doc-b"], "bank")
+    assert store.bulk_calls == 1
+    assert states["doc-a"].tags == ["sensitive"]
+    assert states["doc-b"].metadata == {"classification": "restricted"}
+
+
 async def test_store_owned_sensitive_append_uses_authoritative_document_tags(
     memory_no_llm_verify, request_context, monkeypatch
 ) -> None:
@@ -441,6 +550,27 @@ async def test_store_owned_sensitive_append_uses_authoritative_document_tags(
     from tests.test_memories_extension import InMemoryMemories
 
     class MetadataAwareStore(InMemoryMemories):
+        async def index_facts(self, bank_id, unit_ids, facts, document_id=None, unit_entity_ids=None):
+            # The store-owned retain session supplies its public FactRecord
+            # shape, while this shared test store predates that seam and still
+            # expects ProcessedFact. Preserve the store's observable behavior
+            # without making this routing regression depend on that mismatch.
+            from hindsight_api.engine.memories.base import StoredMemory
+
+            self.calls.append("index_facts")
+            for unit_id, fact in zip(unit_ids, facts):
+                self.rows[unit_id] = StoredMemory(
+                    unit_id=unit_id,
+                    text=fact.text,
+                    fact_type=fact.fact_type,
+                    context=fact.context,
+                    document_id=document_id,
+                    chunk_id=fact.chunk_id,
+                    tags=list(fact.tags or []),
+                    metadata=fact.metadata,
+                    created_at=fact.created_at,
+                )
+
         async def get_document_record(self, *, bank_id, document_id, include_text=False):
             record = await super().get_document_record(
                 bank_id=bank_id,
@@ -454,39 +584,18 @@ async def test_store_owned_sensitive_append_uses_authoritative_document_tags(
     store = MetadataAwareStore({})
     set_memories(store)
     try:
-
-        async def clear_sql_classification(document_id: str) -> None:
-            # Deliberately create SQL/store divergence that no public API can
-            # express, proving append routing treats the store-owned record as
-            # authoritative instead of accidentally passing via the SQL mirror.
-            backend = await memory_no_llm_verify._get_backend()
-            async with acquire_with_retry(backend) as conn:
-                await conn.execute(
-                    f"UPDATE {fq_table('documents')} SET tags = $1, retain_params = $2 WHERE id = $3 AND bank_id = $4",
-                    [],
-                    None,
-                    document_id,
-                    bank_id,
-                )
-                row = await conn.fetchrow(
-                    f"SELECT tags, retain_params FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-                    document_id,
-                    bank_id,
-                )
-                if row is not None:
-                    assert list(conn.parse_json(row["tags"]) or []) == []
-                    assert row["retain_params"] is None
-
         calls = _install_metadata_router(memory_no_llm_verify, monkeypatch)
         bank_id = f"metadata-routing-store-{uuid.uuid4().hex[:8]}"
         document_id = "store-owned-sensitive"
-        await memory_no_llm_verify.retain_batch_async(
-            bank_id,
-            [{"content": "Sensitive store-owned content.", "document_id": document_id, "tags": ["sensitive"]}],
-            request_context=request_context,
-        )
-        assert store.documents[document_id]["tags"] == ["sensitive"]
-        await clear_sql_classification(document_id)
+        store.documents[document_id] = {
+            "id": document_id,
+            "content_hash": "sensitive-seed",
+            "original_text": "Sensitive store-owned content.",
+            "chunk_texts": ["Sensitive store-owned content."],
+            "chunks": ["Sensitive store-owned content."],
+            "tags": ["sensitive"],
+            "metadata": {"retain_params": {}},
+        }
 
         calls.reset()
         await memory_no_llm_verify.retain_batch_async(
@@ -504,18 +613,15 @@ async def test_store_owned_sensitive_append_uses_authoritative_document_tags(
             value="restricted",
         )
         metadata_document_id = "store-owned-restricted"
-        await memory_no_llm_verify.retain_batch_async(
-            bank_id,
-            [
-                {
-                    "content": "Restricted store-owned content.",
-                    "document_id": metadata_document_id,
-                    "metadata": {"classification": "restricted"},
-                }
-            ],
-            request_context=request_context,
-        )
-        await clear_sql_classification(metadata_document_id)
+        store.documents[metadata_document_id] = {
+            "id": metadata_document_id,
+            "content_hash": "restricted-seed",
+            "original_text": "Restricted store-owned content.",
+            "chunk_texts": ["Restricted store-owned content."],
+            "chunks": ["Restricted store-owned content."],
+            "tags": [],
+            "metadata": {"retain_params": {"metadata": {"classification": "restricted"}}},
+        }
 
         calls.reset()
         await memory_no_llm_verify.retain_batch_async(

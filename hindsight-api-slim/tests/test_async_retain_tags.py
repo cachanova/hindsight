@@ -26,6 +26,7 @@ async def test_submit_async_retain_includes_document_tags_in_task_payload(docume
     engine._initialized = True
     engine._authenticate_tenant = AsyncMock()
     engine._operation_validator = None
+    engine._retain_llm_config = MagicMock()
     # Children are now inserted inline (no _submit_async_operation hop), and
     # submit_task fires post-commit. Mock both so the inline path runs cleanly
     # without the test needing real DB or task backend.

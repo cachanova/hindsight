@@ -204,7 +204,6 @@ async def test_metadata_batch_lifecycle_runs_on_sensitive_member() -> None:
     await extract_facts_from_contents_batch_api(
         contents=[RetainContent(content="Sensitive account details.")],
         llm_config=configured,
-        agent_name="test_agent",
         config=_batch_config(),
         pool=None,
         operation_id=None,
@@ -234,7 +233,6 @@ async def test_metadata_batch_resume_stays_on_sensitive_account() -> None:
     await extract_facts_from_contents_batch_api(
         contents=[RetainContent(content="Sensitive account details.")],
         llm_config=configured,
-        agent_name="test_agent",
         config=_batch_config(),
         pool=pool,
         operation_id=str(uuid.uuid4()),

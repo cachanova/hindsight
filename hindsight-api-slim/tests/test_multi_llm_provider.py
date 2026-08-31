@@ -207,15 +207,35 @@ def test_metadata_route_rejects_ambiguous_cross_member_match():
         LLMStrategyConfig(
             mode="metadata",
             routes=[
-                LLMMetadataRoute(key="tags", value="internal", member=1),
-                LLMMetadataRoute(key="tags", value="sensitive", member=2),
+                LLMMetadataRoute(key="metadata.classification", value="internal", member=1),
+                LLMMetadataRoute(key="metadata.clearance", value="restricted", member=2),
             ],
         ),
     )
 
     with pytest.raises(ValueError, match="select multiple members"):
-        router.with_config(object(), routing_metadata={"tags": ["internal", "sensitive"]})
+        router.with_config(
+            object(),
+            routing_metadata={
+                "metadata.classification": ["internal"],
+                "metadata.clearance": ["restricted"],
+            },
+        )
     assert (a.calls, b.calls, c.calls) == (0, 0, 0)
+
+
+def test_metadata_routes_reject_conflicting_tag_members_at_construction():
+    with pytest.raises(ValueError, match="routes with key 'tags' must all select the same member"):
+        MultiLLMProvider(
+            [FakeMember("a", "RA"), FakeMember("b", "RB"), FakeMember("c", "RC")],
+            LLMStrategyConfig(
+                mode="metadata",
+                routes=[
+                    LLMMetadataRoute(key="tags", value="internal", member=1),
+                    LLMMetadataRoute(key="tags", value="sensitive", member=2),
+                ],
+            ),
+        )
 
 
 async def test_metadata_route_allows_multiple_matches_to_same_member():

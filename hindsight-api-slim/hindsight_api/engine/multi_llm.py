@@ -109,6 +109,12 @@ class MultiLLMProvider:
                         f"LLM metadata route {route.key}={route.value!r} selects member {route.member}, "
                         f"but the chain has members 0..{len(members) - 1}."
                     )
+            tag_members = {route.member for route in strategy.routes if route.key == "tags"}
+            if len(tag_members) > 1:
+                raise ValueError(
+                    "Metadata LLM routes with key 'tags' must all select the same member; "
+                    "reflect and consolidation include every configured tag route to stay fail-closed."
+                )
 
     # ── routing ────────────────────────────────────────────────────────────────
 

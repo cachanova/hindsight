@@ -710,13 +710,17 @@ def _retain_llm_routing_metadata(
     for state in append_states or []:
         tags.update(state.tags)
         for key, value in state.metadata.items():
-            if value is not None:
-                values.setdefault(f"metadata.{key}", set()).add(str(value))
+            route_values = value if isinstance(value, (list, tuple, set, frozenset)) else [value]
+            for route_value in route_values:
+                if route_value is not None:
+                    values.setdefault(f"metadata.{key}", set()).add(str(route_value))
     for item in contents:
         tags.update(item.get("tags", []) or [])
         for key, value in (item.get("metadata") or {}).items():
-            if value is not None:
-                values.setdefault(f"metadata.{key}", set()).add(str(value))
+            route_values = value if isinstance(value, (list, tuple, set, frozenset)) else [value]
+            for route_value in route_values:
+                if route_value is not None:
+                    values.setdefault(f"metadata.{key}", set()).add(str(route_value))
     if tags:
         values["tags"] = tags
     return {key: sorted(route_values) for key, route_values in values.items()}
@@ -2907,7 +2911,7 @@ class MemoryEngine(MemoryEngineInterface):
         document_tags = task_dict.get("document_tags")
 
         retain_task_payload: dict[str, Any] = {"contents": retain_contents}
-        if document_tags:
+        if document_tags is not None:
             retain_task_payload["document_tags"] = document_tags
         if task_dict.get("strategy"):
             retain_task_payload["strategy"] = task_dict["strategy"]
@@ -5573,41 +5577,50 @@ class MemoryEngine(MemoryEngineInterface):
         if not append_document_ids:
             return {}
 
+        document_ids = sorted(append_document_ids)
         stored_states: dict[str, _AppendRoutingState] = {}
         backend = await self._get_backend()
         from .memories import get_memories
 
         store = get_memories()
         async with acquire_with_retry(backend) as conn:
-            for append_document_id in append_document_ids:
-                row = await conn.fetchrow(
-                    f"SELECT tags, retain_params FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-                    append_document_id,
-                    bank_id,
-                )
-                tags = row["tags"] if row else None
-                retain_params = row["retain_params"] if row else None
-
-                # A store-owned document may have no SQL row at all. Even when a
-                # metadata row exists, the store record is authoritative and is
-                # the same record the append body path reads before prepending.
-                if store.owns_document_store_for(bank_id):
-                    record = await store.get_document_record(
-                        bank_id=bank_id,
-                        document_id=append_document_id,
-                    )
-                    if record is not None:
-                        if record.get("tags") is not None:
-                            tags = record["tags"]
-                        record_metadata = record.get("metadata") or {}
-                        if record_metadata.get("retain_params") is not None:
-                            retain_params = record_metadata["retain_params"]
-
+            rows = await conn.fetch(
+                f"SELECT id, tags, retain_params FROM {fq_table('documents')} "
+                f"WHERE id = ANY($1::text[]) AND bank_id = $2",
+                document_ids,
+                bank_id,
+            )
+            for row in rows:
+                tags = conn.parse_json(row["tags"])
+                retain_params = conn.parse_json(row["retain_params"])
                 if tags is None and retain_params is None:
                     continue
-                tags = conn.parse_json(tags)
-                retain_params = conn.parse_json(retain_params)
                 metadata = retain_params.get("metadata", {}) if isinstance(retain_params, dict) else {}
+                stored_states[str(row["id"])] = _AppendRoutingState(
+                    tags=list(tags or []),
+                    metadata=dict(metadata) if isinstance(metadata, dict) else {},
+                )
+
+        # Release the pooled database connection before crossing the external
+        # store seam. Store-owned records are authoritative and may not have a
+        # SQL mirror; use the bulk API so remote stores can serve all documents
+        # in one round trip.
+        if store.store_owned_for(bank_id):
+            records = await store.get_document_records(bank_id=bank_id, document_ids=document_ids)
+            for append_document_id, record in records.items():
+                existing = stored_states.get(append_document_id)
+                tags = record.get("tags")
+                if tags is None and existing is not None:
+                    tags = existing.tags
+                record_metadata = record.get("metadata") or {}
+                retain_params = record_metadata.get("retain_params")
+                if retain_params is None and existing is not None:
+                    metadata = existing.metadata
+                else:
+                    retain_params = json.loads(retain_params) if isinstance(retain_params, str) else retain_params
+                    metadata = retain_params.get("metadata", {}) if isinstance(retain_params, dict) else {}
+                if tags is None and not metadata:
+                    continue
                 stored_states[append_document_id] = _AppendRoutingState(
                     tags=list(tags or []),
                     metadata=dict(metadata) if isinstance(metadata, dict) else {},
@@ -5618,7 +5631,7 @@ class MemoryEngine(MemoryEngineInterface):
         self,
         llm_config: "LLMConfig | MultiLLMProvider",
     ) -> dict[str, list[str]]:
-        """Bind reflect to the first configured tag route.
+        """Bind reflect to the configured protected tag lane.
 
         Reflect selects its LLM before the agent runs retrieval tools. Even an
         exact tag scope can expand an allowed fact to its full document, whose
@@ -5640,7 +5653,7 @@ class MemoryEngine(MemoryEngineInterface):
         A consolidation job repeatedly fetches pending batches. A sensitive fact
         may arrive after startup, so a point-in-time existence check cannot safely
         select the primary for the whole job. Including every configured tag route
-        keeps all batches on the first matching protected lane.
+        keeps all batches on the configured protected lane.
         """
         llm_config = self._consolidation_llm_config
         if not (isinstance(llm_config, MultiLLMProvider) and llm_config.strategy.mode == LLM_STRATEGY_METADATA):

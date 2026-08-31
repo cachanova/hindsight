@@ -2078,7 +2078,7 @@ _VALID_LLM_STRATEGY_MODES = (LLM_STRATEGY_FAILOVER, LLM_STRATEGY_ROUND_ROBIN, LL
 
 @dataclass(frozen=True)
 class LLMMetadataRoute:
-    """One ordered metadata match that pins an LLM request to a member."""
+    """One metadata match that pins an LLM request to a member."""
 
     key: str
     value: str
@@ -2091,10 +2091,10 @@ class LLMStrategyConfig:
 
     ``mode`` is "failover" (try members in order) or "round-robin" (rotate the
     starting member per request, then fall through the rest on error), or
-    "metadata" (pin to the first matching route, defaulting to the primary).
+    "metadata" (pin when all matching routes agree, defaulting to the primary).
     ``weights`` is round-robin only: positive integers, one per member (primary
-    first), giving an unbalanced rotation; ``routes`` is metadata only and is
-    evaluated in declaration order.
+    first), giving an unbalanced rotation; ``routes`` is metadata only and every
+    matching route must select the same member.
     """
 
     mode: str
@@ -2107,7 +2107,7 @@ def _parse_llm_strategy(raw: str | None) -> LLMStrategyConfig | None:
 
     Returns ``None`` when unset. The value must be a JSON object with a ``mode``
     of "failover", "round-robin", or "metadata". ``weights`` (round-robin only)
-    must be a list of positive ints. ``routes`` (metadata only) is an ordered list
+    must be a list of positive ints. ``routes`` (metadata only) is a list
     of ``{"key": str, "value": str, "member": non-negative int}`` objects.
     Raises ``ValueError`` on malformed input so misconfiguration fails fast at
     startup rather than silently degrading.
